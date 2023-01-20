@@ -25,6 +25,8 @@
  * I18n, unicode, multi-byte encodings, colored output, controlling terminal
  * magic, and other fancy stuff are not supported.
  *
+ * TODO: dev maj/min print, blocksize
+ *
  * I would prefer to use some string library, but that would be not-my-code.
  *
  * Sorting by default in ls is charcode-based, so we go that route.
@@ -32,6 +34,7 @@
  *
  *
  * */
+#include <unistd.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -50,6 +53,9 @@
 
 
 static size_t LIMIT_STRLEN = 4096;
+#if !defined(PATH_MAX)
+#define PATH_MAX LIMIT_STRLEN
+#endif //!defined(PATH_MAX)
 /* should include <langinfo.h> and do i18n */
 #define TIME_FMT_STR "%b %e  %Y"
 
@@ -182,10 +188,18 @@ struct file_record_t
 {
     struct dirent * fr_dirent;
     struct stat * fr_s_stat;
-    char * fr_print_name;
     enum filetype_t fr_ft;
+    char * fr_link_target;
+    ssize_t fr_link_len;
 };
 
+struct db_t
+{
+    struct dirent ** namelist;
+    struct file_record_t * records;
+};
+
+#if 0
 static char *
 concat_path(char const * at, size_t sz_at, struct dirent * target)
 {
@@ -206,6 +220,7 @@ concat_path(char const * at, size_t sz_at, struct dirent * target)
     free(buf);
     return retval;
 }
+#endif //0
 
 static struct stat *
 stat_dirent(int dirstream_fd, struct dirent * target)
@@ -228,22 +243,13 @@ stat_dirent(int dirstream_fd, struct dirent * target)
     return st;
 }
 
-static int
-generate_printable_name(struct file_record_t * record)
-{
-    assert(NULL != record);
-    record->fr_print_name = record->fr_dirent->d_name;
-}
-
 static ssize_t
-parse_dir(char const * target, struct file_record_t ** out)
+parse_dir(char const * target, struct db_t * out)
 {
     errno = 0;
-    *out = NULL;
-    struct dirent **namelist;
     int n = scandir(
             target,
-            &namelist,
+            &(out->namelist),
             check_ignore_policy_dirent,
             alphasort
             );
@@ -272,16 +278,39 @@ parse_dir(char const * target, struct file_record_t ** out)
     }
     for (size_t i = 0; i < n; ++i)
     {
-        rec_arr[i].fr_dirent = namelist[i];
-        rec_arr[i].fr_ft = extract_filetype_from_dirent(namelist[i]);
-        rec_arr[i].fr_s_stat = stat_dirent(fd, namelist[i]);
-        generate_printable_name(&rec_arr[i]);
+        rec_arr[i].fr_dirent = out->namelist[i];
+        rec_arr[i].fr_ft = extract_filetype_from_dirent(out->namelist[i]);
+        rec_arr[i].fr_s_stat = stat_dirent(fd, out->namelist[i]);
+        if (FTYPE_SYMLINK == rec_arr[i].fr_ft)
+        {
+            rec_arr[i].fr_link_target = malloc(PATH_MAX);
+            if (NULL != rec_arr[i].fr_link_target)
+            {
+                ssize_t sz = readlinkat(fd, out->namelist[i]->d_name, rec_arr[i].fr_link_target, PATH_MAX);
+                if (-1 == sz)
+                {
+                    log_at_libc_err("readlinkat %s", out->namelist[i]->d_name);
+                    free(rec_arr[i].fr_link_target);
+                    rec_arr[i].fr_link_target = NULL;
+                }
+                else
+                {
+                    rec_arr[i].fr_link_target[sz] = '\0';
+                }
+                rec_arr[i].fr_link_len = sz;
+            }
+        }
+        else
+        {
+            rec_arr[i].fr_link_target = NULL;
+            rec_arr[i].fr_link_len = -1;
+        }
     }
     if (0 != closedir(dir))
     {
         log_at_libc_err("on closing directory %s", target);
     }
-    *out = rec_arr;
+    out->records = rec_arr;
     return n;
 }
 
@@ -301,6 +330,20 @@ out_perms(mode_t const perms)
     permbuf[i++] =(perms & S_IWOTH) ? 'w' : '-';
     permbuf[i++] =(perms & S_IXOTH) ? 'x' : '-';
     output_l("%s ", permbuf);
+}
+
+static void
+out_name(struct file_record_t * record)
+{
+    assert(NULL != record);
+    if (FTYPE_SYMLINK == record->fr_ft && NULL != record->fr_link_target)
+    {
+        output("%s -> %s", record->fr_dirent->d_name, record->fr_link_target);
+    }
+    else
+    {
+        output("%s ", record->fr_dirent->d_name);
+    }
 }
 
 static inline void
@@ -331,15 +374,20 @@ consume_record(struct file_record_t * record)
         output_l("%lu ", record->fr_s_stat->st_gid);
     }
 
-    output_l("%10lu ", record->fr_s_stat->st_blocks);
+    output_l("%10lu ", record->fr_s_stat->st_size);
 
     struct tm _tm = {};
     char time_str_buf[20];
     gmtime_r(&(record->fr_s_stat->st_mtim.tv_sec), &_tm);
     strftime(time_str_buf, 20, TIME_FMT_STR, &_tm);
     output_l("%s ", time_str_buf);
-
-    output(record->fr_print_name);
+    out_name(record);
+    free(record->fr_s_stat);
+    free(record->fr_dirent);
+    if (NULL != record->fr_link_target)
+    {
+        free(record->fr_link_target);
+    }
 }
 
 static inline size_t
@@ -362,7 +410,7 @@ consume_dir(struct file_record_t * records, ssize_t rec_arr_sz)
     {
         consume_record(&records[i]);
     }
-
+    free(records);
 }
 
 int
@@ -376,9 +424,10 @@ print_multiple_dirs(char * dir_array[], size_t sz)
             return -1;
         }
         log_debug("%s", dir_array[i]);
-        struct file_record_t * rec_arr;
-        ssize_t rec_arr_sz = parse_dir(dir_array[i], &rec_arr);
-        consume_dir(rec_arr, rec_arr_sz);
+        struct db_t db;
+        ssize_t rec_arr_sz = parse_dir(dir_array[i], &db);
+        consume_dir(db.records, rec_arr_sz);
+        free(db.namelist);
     }
     return 0;
 }
